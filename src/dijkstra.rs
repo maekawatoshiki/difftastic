@@ -1,4 +1,4 @@
-use std::cmp::{min, Ordering, Reverse};
+use std::cmp::{max, min, Ordering, Reverse};
 use std::collections::BinaryHeap;
 
 use crate::syntax::{ChangeKind, Syntax};
@@ -27,6 +27,7 @@ impl<'a> Vertex<'a> {
 #[derive(Debug)]
 struct OrdVertex<'a> {
     distance: u64,
+    remaining_estimate: u64,
     v: Vertex<'a>,
 }
 
@@ -38,7 +39,7 @@ impl<'a> PartialOrd for OrdVertex<'a> {
 
 impl<'a> Ord for OrdVertex<'a> {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.distance.cmp(&other.distance)
+        (self.distance + self.remaining_estimate).cmp(&(other.distance + other.remaining_estimate))
     }
 }
 
@@ -65,7 +66,7 @@ impl Edge {
     fn cost(&self) -> u64 {
         match self {
             // Matching nodes is always best.
-            UnchangedNode(depth_difference) => min(40, *depth_difference),
+            UnchangedNode(depth_difference) => 1 + min(40, *depth_difference),
             // Matching an outer delimiter is good.
             UnchangedDelimiter(depth_difference) => 1000 + min(40, *depth_difference),
             // Otherwise, we've added/removed a node.
@@ -73,6 +74,36 @@ impl Edge {
             NovelDelimiterLHS | NovelDelimiterRHS => 2000,
         }
     }
+}
+
+fn initial_estimate(v: &Vertex) -> u64 {
+    let mut num_lhs_nodes = 0;
+
+    let mut node = v.lhs_syntax;
+    loop {
+        match node {
+            Some(n) => {
+                num_lhs_nodes += 1;
+                node = n.next();
+            }
+            None => break,
+        }
+    }
+
+    let mut num_rhs_nodes = 0;
+
+    let mut node = v.rhs_syntax;
+    loop {
+        match node {
+            Some(n) => {
+                num_rhs_nodes += 1;
+                node = n.next();
+            }
+            None => break,
+        }
+    }
+
+    max(num_lhs_nodes, num_rhs_nodes) * UnchangedNode(0).cost()
 }
 
 fn shortest_path(start: Vertex) -> Vec<(Edge, Vertex)> {
@@ -83,6 +114,7 @@ fn shortest_path(start: Vertex) -> Vec<(Edge, Vertex)> {
 
     heap.push(Reverse(OrdVertex {
         distance: 0,
+        remaining_estimate: initial_estimate(&start),
         v: start.clone(),
     }));
 
@@ -93,7 +125,11 @@ fn shortest_path(start: Vertex) -> Vec<(Edge, Vertex)> {
 
     loop {
         match heap.pop() {
-            Some(Reverse(OrdVertex { distance, v })) => {
+            Some(Reverse(OrdVertex {
+                distance,
+                remaining_estimate,
+                v,
+            })) => {
                 if v.is_end() {
                     break;
                 }
@@ -101,7 +137,7 @@ fn shortest_path(start: Vertex) -> Vec<(Edge, Vertex)> {
                 if visited.contains(&v) {
                     continue;
                 }
-                for (edge, new_v) in neighbours(&v) {
+                for (edge, new_remaining_estimate, new_v) in neighbours(remaining_estimate, &v) {
                     let new_v_distance = distance + edge.cost();
 
                     // Predecessor tracks all the found routes. We
@@ -118,6 +154,7 @@ fn shortest_path(start: Vertex) -> Vec<(Edge, Vertex)> {
                         predecessors.insert(new_v.clone(), (new_v_distance, edge, v.clone()));
                         heap.push(Reverse(OrdVertex {
                             distance: new_v_distance,
+                            remaining_estimate: new_remaining_estimate,
                             v: new_v,
                         }));
                     }
@@ -150,7 +187,7 @@ fn shortest_path(start: Vertex) -> Vec<(Edge, Vertex)> {
     res
 }
 
-fn neighbours<'a>(v: &Vertex<'a>) -> Vec<(Edge, Vertex<'a>)> {
+fn neighbours<'a>(distance_estimate: u64, v: &Vertex<'a>) -> Vec<(Edge, u64, Vertex<'a>)> {
     let mut res = vec![];
 
     if let (Some(lhs_syntax), Some(rhs_syntax)) = (&v.lhs_syntax, &v.rhs_syntax) {
@@ -162,6 +199,7 @@ fn neighbours<'a>(v: &Vertex<'a>) -> Vec<(Edge, Vertex<'a>)> {
             // Both nodes are equal, the happy case.
             res.push((
                 UnchangedNode(depth_difference),
+                distance_estimate - UnchangedNode(0).cost(),
                 Vertex {
                     lhs_syntax: lhs_syntax.next(),
                     rhs_syntax: rhs_syntax.next(),
@@ -203,6 +241,9 @@ fn neighbours<'a>(v: &Vertex<'a>) -> Vec<(Edge, Vertex<'a>)> {
 
                 res.push((
                     UnchangedDelimiter(depth_difference),
+                    distance_estimate - 1
+                        + max(lhs_children.len(), rhs_children.len()) as u64
+                            * UnchangedNode(0).cost(),
                     Vertex {
                         lhs_syntax: lhs_next,
                         rhs_syntax: rhs_next,
@@ -218,6 +259,7 @@ fn neighbours<'a>(v: &Vertex<'a>) -> Vec<(Edge, Vertex<'a>)> {
             Syntax::Atom { .. } => {
                 res.push((
                     NovelAtomLHS,
+                    distance_estimate - UnchangedNode(0).cost(),
                     Vertex {
                         lhs_syntax: lhs_syntax.next(),
                         rhs_syntax: v.rhs_syntax,
@@ -234,6 +276,7 @@ fn neighbours<'a>(v: &Vertex<'a>) -> Vec<(Edge, Vertex<'a>)> {
 
                 res.push((
                     NovelDelimiterLHS,
+                    distance_estimate + children.len() as u64 * UnchangedNode(0).cost(),
                     Vertex {
                         lhs_syntax: lhs_next,
                         rhs_syntax: v.rhs_syntax,
@@ -249,6 +292,7 @@ fn neighbours<'a>(v: &Vertex<'a>) -> Vec<(Edge, Vertex<'a>)> {
             Syntax::Atom { .. } => {
                 res.push((
                     NovelAtomRHS,
+                    distance_estimate - UnchangedNode(0).cost(),
                     Vertex {
                         lhs_syntax: v.lhs_syntax,
                         rhs_syntax: rhs_syntax.next(),
@@ -265,6 +309,7 @@ fn neighbours<'a>(v: &Vertex<'a>) -> Vec<(Edge, Vertex<'a>)> {
 
                 res.push((
                     NovelDelimiterRHS,
+                    distance_estimate + children.len() as u64 * UnchangedNode(0).cost(),
                     Vertex {
                         lhs_syntax: v.lhs_syntax,
                         rhs_syntax: rhs_next,
