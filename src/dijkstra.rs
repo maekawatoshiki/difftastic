@@ -239,11 +239,15 @@ fn neighbours<'a>(distance_estimate: u64, v: &Vertex<'a>) -> Vec<(Edge, u64, Ver
                     - rhs_syntax.info().num_ancestors.get() as i64)
                     .abs() as u64;
 
+                let num_possible_child_matches = min(lhs_children.len(), rhs_children.len()) as u64;
+                let num_extra_children =
+                    max(lhs_children.len(), rhs_children.len()) as u64 - num_possible_child_matches;
+
                 res.push((
                     UnchangedDelimiter(depth_difference),
                     distance_estimate - 1
-                        + max(lhs_children.len(), rhs_children.len()) as u64
-                            * UnchangedNode(0).cost(),
+                        + num_possible_child_matches * UnchangedNode(0).cost()
+                        + num_extra_children * NovelAtomLHS.cost(),
                     Vertex {
                         lhs_syntax: lhs_next,
                         rhs_syntax: rhs_next,
