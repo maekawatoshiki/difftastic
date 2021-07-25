@@ -1,4 +1,4 @@
-use std::cmp::{min, Ordering, Reverse};
+use std::cmp::{max, min, Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::hash::{Hash, Hasher};
 
@@ -8,26 +8,12 @@ use rustc_hash::FxHashMap;
 use strsim::normalized_levenshtein;
 use Edge::*;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Vertex<'a> {
     lhs_syntax: Option<&'a Syntax<'a>>,
     lhs_prev_novel: Option<LineNumber>,
     rhs_syntax: Option<&'a Syntax<'a>>,
     rhs_prev_novel: Option<LineNumber>,
-}
-impl<'a> PartialEq for Vertex<'a> {
-    fn eq(&self, other: &Self) -> bool {
-        self.lhs_syntax.map(|node| node.id()) == other.lhs_syntax.map(|node| node.id())
-            && self.rhs_syntax.map(|node| node.id()) == other.rhs_syntax.map(|node| node.id())
-    }
-}
-impl<'a> Eq for Vertex<'a> {}
-
-impl<'a> Hash for Vertex<'a> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.lhs_syntax.map(|node| node.id()).hash(state);
-        self.rhs_syntax.map(|node| node.id()).hash(state);
-    }
 }
 
 impl<'a> Vertex<'a> {
@@ -47,6 +33,7 @@ impl<'a> Vertex<'a> {
 struct OrdVertex<'a> {
     distance: u64,
     prev: Option<(Vertex<'a>, Edge)>,
+    remaining_estimate: u64,
     v: Vertex<'a>,
 }
 
@@ -58,7 +45,7 @@ impl<'a> PartialOrd for OrdVertex<'a> {
 
 impl<'a> Ord for OrdVertex<'a> {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.distance.cmp(&other.distance)
+        (self.distance + self.remaining_estimate).cmp(&(other.distance + other.remaining_estimate))
     }
 }
 
@@ -119,6 +106,36 @@ impl Edge {
     }
 }
 
+fn initial_estimate(v: &Vertex) -> u64 {
+    let mut num_lhs_nodes = 0;
+
+    let mut node = v.lhs_syntax;
+    loop {
+        match node {
+            Some(n) => {
+                num_lhs_nodes += 1;
+                node = n.next();
+            }
+            None => break,
+        }
+    }
+
+    let mut num_rhs_nodes = 0;
+
+    let mut node = v.rhs_syntax;
+    loop {
+        match node {
+            Some(n) => {
+                num_rhs_nodes += 1;
+                node = n.next();
+            }
+            None => break,
+        }
+    }
+
+    max(num_lhs_nodes, num_rhs_nodes) * UnchangedNode(0).cost()
+}
+
 fn shortest_path(start: Vertex) -> Vec<(Edge, Vertex)> {
     // We want to visit nodes with the shortest distance first, but
     // BinaryHeap is a max-heap. Ensure nodes are wrapped with Reverse
@@ -128,38 +145,52 @@ fn shortest_path(start: Vertex) -> Vec<(Edge, Vertex)> {
     heap.push(Reverse(OrdVertex {
         distance: 0,
         prev: None,
+        remaining_estimate: initial_estimate(&start),
         v: start.clone(),
     }));
 
     // TODO: this grows very big. Consider using IDA* to reduce memory
     // usage.
-    let mut predecessors: FxHashMap<Vertex, Option<(Vertex, Edge)>> = FxHashMap::default();
+    let mut predecessors: FxHashMap<Vertex, Option<(u64, Edge, Vertex)>> = FxHashMap::default();
 
     let end;
     loop {
         match heap.pop() {
-            Some(Reverse(OrdVertex { distance, prev, v })) => {
-                if predecessors.contains_key(&v) {
-                    continue;
-                }
-                predecessors.insert(v.clone(), prev);
-
+            Some(Reverse(OrdVertex {
+                distance,
+                prev,
+                remaining_estimate,
+                v,
+            })) => {
                 if v.is_end() {
                     end = v;
                     break;
                 }
 
-                for (edge, new_v) in neighbours(&v) {
-                    if predecessors.contains_key(&new_v) {
-                        continue;
-                    }
+                if predecessors.contains_key(&v) {
+                    continue;
+                }
+                for (edge, new_remaining_estimate, new_v) in neighbours(remaining_estimate, &v) {
                     let new_v_distance = distance + edge.cost();
 
-                    heap.push(Reverse(OrdVertex {
-                        distance: new_v_distance,
-                        prev: Some((v.clone(), edge)),
-                        v: new_v,
-                    }));
+                    // Predecessor tracks all the found routes. We
+                    // visit nodes starting with the shortest route,
+                    // but we may have found a longer route to an
+                    // unvisited node. In that case, we want to update
+                    // the known shortest route.
+                    let found_shorter_route = match predecessors.get(&new_v) {
+                        Some((prev_shortest, _, _)) => new_v_distance < *prev_shortest,
+                        None => true,
+                    };
+
+                    if found_shorter_route {
+                        predecessors.insert(new_v.clone(), (new_v_distance, edge, v.clone()));
+                        heap.push(Reverse(OrdVertex {
+                            distance: new_v_distance,
+                            remaining_estimate: new_remaining_estimate,
+                            v: new_v,
+                        }));
+                    }
                 }
             }
             None => panic!("Ran out of graph nodes before reaching end"),
@@ -168,9 +199,16 @@ fn shortest_path(start: Vertex) -> Vec<(Edge, Vertex)> {
 
     let mut current = end;
     let mut res: Vec<(Edge, Vertex)> = vec![];
-    while let Some(Some((node, edge))) = predecessors.remove(&current) {
-        res.push((edge, node.clone()));
-        current = node;
+    loop {
+        match predecessors.remove(&current) {
+            Some((_, edge, node)) => {
+                res.push((edge, node.clone()));
+                current = node;
+            }
+            None => {
+                break;
+            }
+        }
     }
 
     res.reverse();
@@ -179,7 +217,7 @@ fn shortest_path(start: Vertex) -> Vec<(Edge, Vertex)> {
 
 const NOVEL_TREE_THRESHOLD: u64 = 20;
 
-fn neighbours<'a>(v: &Vertex<'a>) -> Vec<(Edge, Vertex<'a>)> {
+fn neighbours<'a>(distance_estimate: u64, v: &Vertex<'a>) -> Vec<(Edge, u64, Vertex<'a>)> {
     let mut res = vec![];
 
     if let (Some(lhs_syntax), Some(rhs_syntax)) = (&v.lhs_syntax, &v.rhs_syntax) {
@@ -191,6 +229,7 @@ fn neighbours<'a>(v: &Vertex<'a>) -> Vec<(Edge, Vertex<'a>)> {
             // Both nodes are equal, the happy case.
             res.push((
                 UnchangedNode(depth_difference),
+                distance_estimate - UnchangedNode(0).cost(),
                 Vertex {
                     lhs_syntax: lhs_syntax.next(),
                     rhs_syntax: rhs_syntax.next(),
@@ -234,6 +273,9 @@ fn neighbours<'a>(v: &Vertex<'a>) -> Vec<(Edge, Vertex<'a>)> {
 
                 res.push((
                     UnchangedDelimiter(depth_difference),
+                    distance_estimate - 1
+                        + max(lhs_children.len(), rhs_children.len()) as u64
+                            * UnchangedNode(0).cost(),
                     Vertex {
                         lhs_syntax: lhs_next,
                         lhs_prev_novel: None,
@@ -284,6 +326,7 @@ fn neighbours<'a>(v: &Vertex<'a>) -> Vec<(Edge, Vertex<'a>)> {
                     NovelAtomLHS {
                         contiguous: v.lhs_prev_novel == lhs_syntax.first_line(),
                     },
+                    distance_estimate - UnchangedNode(0).cost(),
                     Vertex {
                         lhs_syntax: lhs_syntax.next(),
                         lhs_prev_novel: lhs_syntax.last_line(),
@@ -293,12 +336,7 @@ fn neighbours<'a>(v: &Vertex<'a>) -> Vec<(Edge, Vertex<'a>)> {
                 ));
             }
             // Step into this partially/fully novel list.
-            Syntax::List {
-                open_position,
-                children,
-                num_descendants,
-                ..
-            } => {
+            Syntax::List { children, .. } => {
                 let lhs_next = if children.is_empty() {
                     lhs_syntax.next()
                 } else {
@@ -310,6 +348,7 @@ fn neighbours<'a>(v: &Vertex<'a>) -> Vec<(Edge, Vertex<'a>)> {
                     NovelDelimiterLHS {
                         contiguous: v.lhs_prev_novel == lhs_syntax.first_line(),
                     },
+                    distance_estimate + children.len() as u64 * UnchangedNode(0).cost(),
                     Vertex {
                         lhs_syntax: lhs_next,
                         lhs_prev_novel: open_position.last().map(|lp| lp.line),
@@ -343,6 +382,7 @@ fn neighbours<'a>(v: &Vertex<'a>) -> Vec<(Edge, Vertex<'a>)> {
                     NovelAtomRHS {
                         contiguous: v.rhs_prev_novel == rhs_syntax.first_line(),
                     },
+                    distance_estimate - UnchangedNode(0).cost(),
                     Vertex {
                         lhs_syntax: v.lhs_syntax,
                         lhs_prev_novel: v.lhs_prev_novel,
@@ -352,12 +392,7 @@ fn neighbours<'a>(v: &Vertex<'a>) -> Vec<(Edge, Vertex<'a>)> {
                 ));
             }
             // Step into this partially/fully novel list.
-            Syntax::List {
-                open_position,
-                children,
-                num_descendants,
-                ..
-            } => {
+            Syntax::List { children, .. } => {
                 let rhs_next = if children.is_empty() {
                     rhs_syntax.next()
                 } else {
@@ -368,6 +403,7 @@ fn neighbours<'a>(v: &Vertex<'a>) -> Vec<(Edge, Vertex<'a>)> {
                     NovelDelimiterRHS {
                         contiguous: v.rhs_prev_novel == rhs_syntax.first_line(),
                     },
+                    distance_estimate + children.len() as u64 * UnchangedNode(0).cost(),
                     Vertex {
                         lhs_syntax: v.lhs_syntax,
                         lhs_prev_novel: v.lhs_prev_novel,
